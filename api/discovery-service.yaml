@@ -1,0 +1,302 @@
+openapi: 3.1.0
+info:
+  title: discovery-service
+  version: 1.0.0
+  summary: Поиск и фильтры по открытым закупкам (read-модель на OpenSearch)
+  description: |
+    Сервис отвечает за список открытых закупок с полнотекстовым поиском и фильтрами. Собственных бизнес-данных не создаёт:
+    поисковый индекс строится из событий purchase-service и participation-service и может быть перестроен
+    повторным чтением топиков Kafka. В индексе находятся только закупки в статусе `OPEN`.
+
+    Данные в индексе обновляются с задержкой в доли секунды (согласованность в конечном счёте); карточка закупки и точный
+    прогресс запрашиваются у purchase-service и participation-service.
+  license: { name: Proprietary (учебный проект) }
+servers:
+  - url: http://localhost:8080
+    description: API Gateway (внешние эндпоинты /api/**)
+  - url: http://discovery-service:8084
+    description: Прямой адрес сервиса внутри сети (внутренние эндпоинты /internal/**)
+security:
+  - bearerAuth: []
+tags:
+  - name: public
+    description: Внешние эндпоинты, доступные клиенту через API Gateway
+  - name: internal
+    description: Внутренние эндпоинты обслуживания
+x-async-messages: []
+x-consumed-messages:
+  - { eventType: "purchase.published, purchase.updated", topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseSnapshotPayload", action: "добавить или обновить документ закупки в индексе" }
+  - { eventType: "purchase.recruitment-closed, purchase.cancelled", topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseRecruitmentClosedEvent", action: "удалить документ из индекса (закупка больше не открыта)" }
+  - { eventType: participation.changed, topic: participations, publisher: participation-service, schemaRef: "participation-service.yaml#/components/schemas/ParticipationChangedEvent", action: "обновить collectedQuantity, participantsCount и текущую цену в документе" }
+paths:
+  /api/v1/discovery/purchases:
+    get:
+      tags: [public]
+      operationId: searchPurchases
+      summary: Поиск открытых закупок
+      description: |
+        Полнотекстовый поиск `q` по названию и описанию с русской морфологией, фильтры по категории, месту выдачи, цене и сроку набора.
+        Без `q` возвращает все открытые закупки в выбранной сортировке. Страницы - `page`/`size`.
+      parameters:
+        - in: query
+          name: q
+          description: Строка поиска
+          schema: { type: string, maxLength: 100 }
+          example: кофе
+        - in: query
+          name: category
+          description: Одна или несколько категорий
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { type: string, enum: [GROCERIES, HOUSEHOLD, OFFICE, CLOTHING, ELECTRONICS, OTHER] }
+        - in: query
+          name: pickupLocation
+          description: Точное значение места выдачи из фасета
+          schema: { type: string }
+        - in: query
+          name: priceFrom
+          description: Минимальная текущая цена за единицу, рубли
+          schema: { type: string, pattern: '^\d+\.\d{2}$' }
+        - in: query
+          name: priceTo
+          description: Максимальная текущая цена за единицу, рубли
+          schema: { type: string, pattern: '^\d+\.\d{2}$' }
+        - in: query
+          name: deadlineBefore
+          description: Срок набора не позже этой даты
+          schema: { type: string, format: date-time }
+        - in: query
+          name: sort
+          description: Сортировка. `progress` - сначала закупки, которым меньше всего не хватает до минимума.
+          schema: { type: string, enum: [deadline, progress, newest, price], default: deadline }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница результатов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchaseCardPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/discovery/facets:
+    get:
+      tags: [public]
+      operationId: getFacets
+      summary: Значения для фильтров с количеством закупок
+      description: Категории и места выдачи среди открытых закупок, чтобы построить фильтры интерфейса.
+      responses:
+        '200':
+          description: Фасеты
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Facets' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /internal/v1/index/rebuild:
+    post:
+      tags: [internal]
+      operationId: rebuildIndex
+      summary: Перестроить индекс из Kafka
+      description: |
+        Создаёт новый индекс, перечитывает топики purchases и participations с начала и переключает алиас после догона.
+        Поиск работает на старом индексе, пока идёт перестроение. Вызывается только сервисным токеном (из внешней сети эндпоинт недоступен).
+      security:
+        - serviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Перестроение запущено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RebuildAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT, выданный Keycloak (OAuth 2.0 / OIDC). Realm-роли PARTICIPANT, ORGANIZER, ADMIN.
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен сервисного аккаунта Keycloak (client credentials) с ролью internal-service. Используется только для /internal/**.
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: UUID, который клиент генерирует один раз на операцию. Повтор с тем же ключом возвращает результат первого вызова, а не выполняет операцию заново. Ключи хранятся 24 часа.
+      schema: { type: string, format: uuid }
+    Page:
+      in: query
+      name: page
+      description: Номер страницы, начиная с 0
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      in: query
+      name: size
+      description: Размер страницы
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  responses:
+    BadRequest:
+      description: Ошибка валидации запроса
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/validation-error
+            title: Ошибка валидации
+            status: 400
+            code: VALIDATION_ERROR
+            detail: Поле quantity должно быть больше 0
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Unauthorized:
+      description: Нет токена или он недействителен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/unauthorized
+            title: Не авторизован
+            status: 401
+            code: UNAUTHORIZED
+            detail: Токен отсутствует или просрочен
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Forbidden:
+      description: Недостаточно прав (роль или не владелец ресурса)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/forbidden
+            title: Доступ запрещён
+            status: 403
+            code: FORBIDDEN
+            detail: Операция доступна только организатору закупки
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Conflict:
+      description: Конфликт состояния (неподходящий статус, повтор с другим телом, нарушение инварианта). Конкретный код - в поле code.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/invalid-state
+            title: Конфликт состояния
+            status: 409
+            code: INVALID_STATE
+            detail: Операция недопустима в текущем статусе
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  schemas:
+    PurchaseCard:
+      type: object
+      required: [purchaseId, title, category, unit, pickupLocation, retailUnitPrice, currentUnitPrice, minTotalQuantity, collectedQuantity, participantsCount, recruitmentDeadline]
+      properties:
+        purchaseId: { type: string, format: uuid }
+        title: { type: string }
+        snippet: { type: string, description: Фрагмент описания с подсветкой найденных слов тегами em }
+        category: { type: string }
+        unit: { type: string }
+        pickupLocation: { type: string }
+        retailUnitPrice: { $ref: '#/components/schemas/Money' }
+        currentUnitPrice: { $ref: '#/components/schemas/Money' }
+        minTotalQuantity: { type: number }
+        collectedQuantity: { type: number }
+        participantsCount: { type: integer }
+        recruitmentDeadline: { type: string, format: date-time }
+      example:
+        purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        title: Кофе в зёрнах Арабика 1 кг
+        snippet: Берём у обжарщика, срок хранения 6 месяцев
+        category: GROCERIES
+        unit: KG
+        pickupLocation: Общежитие №3, комната вахтёра
+        retailUnitPrice: { amount: '1600.00', currency: RUB }
+        currentUnitPrice: { amount: '1250.00', currency: RUB }
+        minTotalQuantity: 5
+        collectedQuantity: 7
+        participantsCount: 4
+        recruitmentDeadline: '2026-11-20T18:00:00Z'
+    PurchaseCardPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/PurchaseCard' }
+    FacetValue:
+      type: object
+      required: [value, count]
+      properties:
+        value: { type: string }
+        count: { type: integer }
+    Facets:
+      type: object
+      required: [categories, pickupLocations]
+      properties:
+        categories:
+          type: array
+          items: { $ref: '#/components/schemas/FacetValue' }
+        pickupLocations:
+          type: array
+          items: { $ref: '#/components/schemas/FacetValue' }
+      example:
+        categories:
+          - { value: GROCERIES, count: 12 }
+          - { value: HOUSEHOLD, count: 5 }
+        pickupLocations:
+          - { value: 'Общежитие №3, комната вахтёра', count: 4 }
+    RebuildAccepted:
+      type: object
+      required: [rebuildId, startedAt]
+      properties:
+        rebuildId: { type: string, format: uuid }
+        startedAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      description: Единая модель ошибки для всех сервисов (RFC 9457, Content-Type application/problem+json)
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, description: Ссылка на описание типа ошибки }
+        title: { type: string, description: Краткое описание }
+        status: { type: integer, description: HTTP-статус }
+        code: { type: string, description: Машинный код из справочника ошибок README, example: VALIDATION_ERROR }
+        detail: { type: string, description: Подробности для разработчика или пользователя }
+        instance: { type: string, description: Путь запроса }
+        traceId: { type: string, description: Идентификатор трассировки для поиска в логах }
+        errors:
+          type: array
+          description: Ошибки по полям (для VALIDATION_ERROR)
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }
+    Money:
+      type: object
+      description: Денежная сумма. Сумма - строка с десятичной точкой и двумя знаками, чтобы не терять точность.
+      required: [amount, currency]
+      properties:
+        amount: { type: string, pattern: '^\d+\.\d{2}$', example: '1250.00' }
+        currency: { type: string, enum: [RUB], example: RUB }
+    PageMeta:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }

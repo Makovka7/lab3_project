@@ -1,0 +1,469 @@
+openapi: 3.1.0
+info:
+  title: settlement-service
+  version: 1.0.0
+  summary: Расчёты с участниками - начисления, распределение доставки, учёт оплат
+  description: |
+    Сервис владеет сущностью **Начисление** (сколько должен каждый участник) и отметками об оплате.
+    Онлайн-оплата не поддерживается: деньги передаются организатору напрямую, организатор вручную отмечает оплату.
+
+    Жизненный цикл начисления: `PRELIMINARY` (создано при закрытии набора, доставка ещё неизвестна) →
+    `UNPAID` (окончательная сумма после оформления заказа) → `PAID`; `VOIDED` - закупка отменена.
+    В интерфейсе `PRELIMINARY` и `UNPAID` показываются как «не оплачено», `PRELIMINARY` - с пометкой «сумма предварительная».
+
+    **Правила расчёта.** Сумма за товар = количество × цена за единицу, зафиксированная при закрытии набора,
+    округление до копейки. Доставка делится пропорционально количеству; остаток копеек после округления вниз
+    раздаётся по одной копейке участникам с наибольшим количеством, поэтому сумма долей доставки точно равна стоимости доставки.
+
+    Внутренних (`internal`) эндпоинтов у сервиса нет: он общается с остальными через события и сам вызывает participation-service.
+  license: { name: Proprietary (учебный проект) }
+servers:
+  - url: http://localhost:8080
+    description: API Gateway (внешние эндпоинты /api/**)
+  - url: http://settlement-service:8083
+    description: Прямой адрес сервиса внутри сети
+security:
+  - bearerAuth: []
+tags:
+  - name: public
+    description: Внешние эндпоинты, доступные клиенту через API Gateway
+x-async-messages:
+  - { eventType: settlement.charges-created, topic: settlements, key: purchaseId, publisher: settlement-service, subscribers: [purchase-service], schema: { $ref: '#/components/schemas/SettlementChargesCreatedEvent' } }
+  - { eventType: settlement.charges-failed, topic: settlements, key: purchaseId, publisher: settlement-service, subscribers: [purchase-service], schema: { $ref: '#/components/schemas/SettlementChargesFailedEvent' } }
+  - { eventType: settlement.charge-issued, topic: settlements, key: purchaseId, publisher: settlement-service, subscribers: [notification-service], schema: { $ref: '#/components/schemas/SettlementChargeIssuedEvent' } }
+  - { eventType: settlement.charge-finalized, topic: settlements, key: purchaseId, publisher: settlement-service, subscribers: [notification-service], schema: { $ref: '#/components/schemas/SettlementChargeFinalizedEvent' } }
+  - { eventType: settlement.all-paid, topic: settlements, key: purchaseId, publisher: settlement-service, subscribers: [purchase-service], schema: { $ref: '#/components/schemas/SettlementAllPaidEvent' } }
+x-consumed-messages:
+  - { eventType: "purchase.published, purchase.updated", topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseSnapshotPayload", action: "хранить organizerId и название закупки для проверки прав организатора" }
+  - { eventType: purchase.closing-started, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseClosingStartedEvent", action: "вызвать participation-service GET /internal/v1/purchases/{id}/participations, в одной транзакции создать начисления PRELIMINARY и опубликовать settlement.charges-created и settlement.charge-issued; при невозможности - settlement.charges-failed" }
+  - { eventType: purchase.closing-failed, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseClosingFailedEvent", action: "аннулировать начисления этой саги, если они уже созданы; запомнить sagaId как отменённую, чтобы запоздавшее closing-started было проигнорировано" }
+  - { eventType: purchase.ordered, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseOrderedEvent", action: "распределить доставку, перевести начисления в UNPAID и опубликовать settlement.charge-finalized по каждому" }
+  - { eventType: purchase.delivered, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseDeliveredEvent", action: "обновить статус копии закупки" }
+  - { eventType: purchase.cancelled, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseCancelledEvent", action: "перевести неоплаченные начисления в VOIDED" }
+paths:
+  /api/v1/users/me/charges:
+    get:
+      tags: [public]
+      operationId: listMyCharges
+      summary: Мои начисления (кто сколько должен)
+      description: Роль PARTICIPANT. Для личного кабинета.
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/ChargeStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница начислений текущего пользователя
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChargePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/charges/{chargeId}:
+    parameters:
+      - $ref: '#/components/parameters/ChargeId'
+    get:
+      tags: [public]
+      operationId: getCharge
+      summary: Получить начисление
+      description: Доступно владельцу начисления, организатору закупки и ADMIN.
+      responses:
+        '200':
+          description: Начисление
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Charge' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/purchases/{purchaseId}/charges:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    get:
+      tags: [public]
+      operationId: listPurchaseCharges
+      summary: Начисления по закупке (для организатора)
+      description: Роль ORGANIZER, владелец закупки, или ADMIN. Фильтр по статусу позволяет быстро увидеть должников.
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/ChargeStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница начислений
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChargePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/purchases/{purchaseId}/settlement:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    get:
+      tags: [public]
+      operationId: getSettlementSummary
+      summary: Сводка по расчётам закупки
+      description: Роль ORGANIZER, владелец закупки, или ADMIN. Сколько всего начислено, сколько оплачено, сколько участников ещё не оплатили.
+      responses:
+        '200':
+          description: Сводка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettlementSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/charges/{chargeId}/mark-paid:
+    parameters:
+      - $ref: '#/components/parameters/ChargeId'
+    post:
+      tags: [public]
+      operationId: markChargePaid
+      summary: Отметить, что участник оплатил
+      description: |
+        Роль ORGANIZER, владелец закупки. Допустимо только для окончательного начисления (`UNPAID`), то есть после оформления заказа;
+        для `PRELIMINARY` вернётся `409 CHARGE_NOT_FINAL`. Операция естественно идемпотентна: повтор для `PAID` возвращает 200 без изменений.
+        Когда оплачены все начисления закупки, публикуется `settlement.all-paid`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MarkPaidRequest' }
+            example: { note: Перевод по СБП }
+      responses:
+        '200':
+          description: Начисление в статусе PAID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Charge' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/charges/{chargeId}/mark-unpaid:
+    parameters:
+      - $ref: '#/components/parameters/ChargeId'
+    post:
+      tags: [public]
+      operationId: markChargeUnpaid
+      summary: Снять отметку об оплате (исправление ошибки)
+      description: Роль ORGANIZER, владелец закупки. Допустимо из `PAID`, пока закупка не `COMPLETED`. Повтор для `UNPAID` возвращает 200.
+      responses:
+        '200':
+          description: Начисление в статусе UNPAID
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Charge' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT, выданный Keycloak (OAuth 2.0 / OIDC). Realm-роли PARTICIPANT, ORGANIZER, ADMIN.
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен сервисного аккаунта Keycloak (client credentials) с ролью internal-service. Используется только для /internal/**.
+  parameters:
+    PurchaseId:
+      in: path
+      name: purchaseId
+      required: true
+      description: Идентификатор закупки
+      schema: { type: string, format: uuid }
+    ChargeId:
+      in: path
+      name: chargeId
+      required: true
+      description: Идентификатор начисления
+      schema: { type: string, format: uuid }
+    Page:
+      in: query
+      name: page
+      description: Номер страницы, начиная с 0
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      in: query
+      name: size
+      description: Размер страницы
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  responses:
+    Unauthorized:
+      description: Нет токена или он недействителен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/unauthorized
+            title: Не авторизован
+            status: 401
+            code: UNAUTHORIZED
+            detail: Токен отсутствует или просрочен
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Forbidden:
+      description: Недостаточно прав (роль или не владелец ресурса)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/forbidden
+            title: Доступ запрещён
+            status: 403
+            code: FORBIDDEN
+            detail: Операция доступна только организатору закупки
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/not-found
+            title: Не найдено
+            status: 404
+            code: NOT_FOUND
+            detail: Ресурс с указанным идентификатором не существует
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Conflict:
+      description: Конфликт состояния (неподходящий статус, повтор с другим телом, нарушение инварианта). Конкретный код - в поле code.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/invalid-state
+            title: Конфликт состояния
+            status: 409
+            code: INVALID_STATE
+            detail: Операция недопустима в текущем статусе
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  schemas:
+    ChargeStatus:
+      type: string
+      enum: [PRELIMINARY, UNPAID, PAID, VOIDED]
+    MarkPaidRequest:
+      type: object
+      properties:
+        note: { type: string, maxLength: 200, description: Комментарий организатора, например способ оплаты }
+    Charge:
+      type: object
+      required: [id, purchaseId, participationId, userId, quantity, unit, unitPrice, itemsAmount, deliveryShare, totalAmount, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        purchaseId: { type: string, format: uuid }
+        purchaseTitle: { type: string }
+        participationId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        unit: { type: string }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+        itemsAmount: { $ref: '#/components/schemas/Money' }
+        deliveryShare:
+          description: Доля доставки; для PRELIMINARY равна 0.00
+          $ref: '#/components/schemas/Money'
+        totalAmount: { $ref: '#/components/schemas/Money' }
+        status: { $ref: '#/components/schemas/ChargeStatus' }
+        paidAt: { type: string, format: date-time }
+        note: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+      example:
+        id: c4a1e8d2-6b3f-4975-8e0a-1f2b3c4d5e6f
+        purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        purchaseTitle: Кофе в зёрнах Арабика 1 кг
+        participationId: 1d7a3f52-90c4-4e8b-a6d1-0c5e8b2f4a17
+        userId: 9e1b2c3d-4f50-4a61-8b72-c3d4e5f60718
+        quantity: 2.5
+        unit: KG
+        unitPrice: { amount: '1150.00', currency: RUB }
+        itemsAmount: { amount: '2875.00', currency: RUB }
+        deliveryShare: { amount: '142.86', currency: RUB }
+        totalAmount: { amount: '3017.86', currency: RUB }
+        status: UNPAID
+        createdAt: '2026-11-20T18:00:05Z'
+        updatedAt: '2026-11-22T09:10:00Z'
+    ChargePage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Charge' }
+    SettlementSummary:
+      type: object
+      required: [purchaseId, stage, chargesCount, paidCount, unpaidCount, itemsAmount, deliveryCost, totalAmount, paidAmount]
+      properties:
+        purchaseId: { type: string, format: uuid }
+        stage: { type: string, enum: [PRELIMINARY, FINAL, VOIDED], description: 'PRELIMINARY - доставка ещё не учтена, FINAL - суммы окончательные' }
+        chargesCount: { type: integer }
+        paidCount: { type: integer }
+        unpaidCount: { type: integer }
+        itemsAmount: { $ref: '#/components/schemas/Money' }
+        deliveryCost: { $ref: '#/components/schemas/Money' }
+        totalAmount: { $ref: '#/components/schemas/Money' }
+        paidAmount: { $ref: '#/components/schemas/Money' }
+      example:
+        purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        stage: FINAL
+        chargesCount: 6
+        paidCount: 2
+        unpaidCount: 4
+        itemsAmount: { amount: '12075.00', currency: RUB }
+        deliveryCost: { amount: '600.00', currency: RUB }
+        totalAmount: { amount: '12675.00', currency: RUB }
+        paidAmount: { amount: '4300.00', currency: RUB }
+    SettlementChargesCreatedEvent:
+      description: 'Топик settlements (ключ purchaseId). Издатель: settlement-service. Подписчики: purchase-service (успешный шаг саги закрытия набора). correlationId равен sagaId. Публикуется в той же транзакции, что и создание начислений (transactional outbox).'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: settlement.charges-created }
+            payload:
+              type: object
+              required: [purchaseId, sagaId, chargesCount, totalAmount]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                sagaId: { type: string, format: uuid }
+                chargesCount: { type: integer }
+                totalAmount: { $ref: '#/components/schemas/Money' }
+          example:
+            eventId: b2e0c7f4-1a93-4f0d-8c6e-7d25a1e9f310
+            eventType: settlement.charges-created
+            schemaVersion: 1
+            occurredAt: '2026-11-20T18:00:05Z'
+            correlationId: 5d2c7a10-3b9e-4f6a-8c11-2e7f90ab1c3d
+            payload:
+              purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+              sagaId: 5d2c7a10-3b9e-4f6a-8c11-2e7f90ab1c3d
+              chargesCount: 6
+              totalAmount: { amount: '12075.00', currency: RUB }
+    SettlementChargesFailedEvent:
+      description: 'Топик settlements (ключ purchaseId). Издатель: settlement-service. Подписчики: purchase-service (запускает компенсацию саги). Начисления при этом не создаются: транзакция откатывается целиком.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: settlement.charges-failed }
+            payload:
+              type: object
+              required: [purchaseId, sagaId, reason]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                sagaId: { type: string, format: uuid }
+                reason: { type: string, enum: [PARTICIPATION_UNAVAILABLE, PARTICIPANTS_MISMATCH, INTERNAL_ERROR] }
+                detail: { type: string }
+    SettlementChargeIssuedEvent:
+      description: 'Топик settlements. Издатель: settlement-service. Подписчики: notification-service (письмо участнику: набор закрыт, ваша предварительная сумма). Одно событие на участника.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: settlement.charge-issued }
+            payload:
+              type: object
+              required: [chargeId, purchaseId, userId, purchaseTitle, totalAmount]
+              properties:
+                chargeId: { type: string, format: uuid }
+                purchaseId: { type: string, format: uuid }
+                userId: { type: string, format: uuid }
+                purchaseTitle: { type: string }
+                quantity: { type: number }
+                totalAmount: { $ref: '#/components/schemas/Money' }
+    SettlementChargeFinalizedEvent:
+      description: 'Топик settlements. Издатель: settlement-service. Подписчики: notification-service (письмо участнику с окончательной суммой с учётом доставки). Одно событие на участника после purchase.ordered.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: settlement.charge-finalized }
+            payload:
+              type: object
+              required: [chargeId, purchaseId, userId, purchaseTitle, deliveryShare, totalAmount]
+              properties:
+                chargeId: { type: string, format: uuid }
+                purchaseId: { type: string, format: uuid }
+                userId: { type: string, format: uuid }
+                purchaseTitle: { type: string }
+                deliveryShare: { $ref: '#/components/schemas/Money' }
+                totalAmount: { $ref: '#/components/schemas/Money' }
+    SettlementAllPaidEvent:
+      description: 'Топик settlements (ключ purchaseId). Издатель: settlement-service. Подписчики: purchase-service (условие завершения закупки). Публикуется, когда все начисления закупки в статусе PAID; если отметку сняли и поставили снова, событие может прийти повторно - потребитель идемпотентен.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: settlement.all-paid }
+            payload:
+              type: object
+              required: [purchaseId, totalAmount]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                totalAmount: { $ref: '#/components/schemas/Money' }
+    Problem:
+      type: object
+      description: Единая модель ошибки для всех сервисов (RFC 9457, Content-Type application/problem+json)
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, description: Ссылка на описание типа ошибки }
+        title: { type: string, description: Краткое описание }
+        status: { type: integer, description: HTTP-статус }
+        code: { type: string, description: Машинный код из справочника ошибок README, example: VALIDATION_ERROR }
+        detail: { type: string, description: Подробности для разработчика или пользователя }
+        instance: { type: string, description: Путь запроса }
+        traceId: { type: string, description: Идентификатор трассировки для поиска в логах }
+        errors:
+          type: array
+          description: Ошибки по полям (для VALIDATION_ERROR)
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }
+    Money:
+      type: object
+      description: Денежная сумма. Сумма - строка с десятичной точкой и двумя знаками, чтобы не терять точность.
+      required: [amount, currency]
+      properties:
+        amount: { type: string, pattern: '^\d+\.\d{2}$', example: '1250.00' }
+        currency: { type: string, enum: [RUB], example: RUB }
+    Quantity:
+      type: number
+      description: Количество в единицах закупки (кг, шт., л), кратное quantityStep закупки
+      exclusiveMinimum: 0
+      example: 2.5
+    PageMeta:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }
+    EventEnvelope:
+      type: object
+      description: Общий конверт всех событий и команд в Kafka
+      required: [eventId, eventType, schemaVersion, occurredAt, correlationId, payload]
+      properties:
+        eventId: { type: string, format: uuid, description: Уникальный идентификатор сообщения; потребитель хранит обработанные eventId и игнорирует повторы }
+        eventType: { type: string, description: Тип события или команды, например purchase.closing-started }
+        schemaVersion: { type: integer, minimum: 1, description: Версия схемы payload, example: 1 }
+        occurredAt: { type: string, format: date-time }
+        correlationId: { type: string, format: uuid, description: Сквозной идентификатор бизнес-операции (для саги - sagaId) }
+        payload: { type: object }

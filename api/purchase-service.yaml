@@ -1,0 +1,841 @@
+openapi: 3.1.0
+info:
+  title: purchase-service
+  version: 1.0.0
+  summary: Закупки - создание, ступенчатые цены, жизненный цикл статусов, модерация
+  description: |
+    Сервис владеет сущностью **Закупка** и её статусами. Он же оркестрирует сагу «закрытие набора»
+    (см. README, раздел «Сценарий сбоя»).
+
+    Статусы: `OPEN` → `CLOSING` (техническое, идёт сага) → `RECRUITMENT_CLOSED` → `ORDERED` → `DELIVERED` → `COMPLETED`;
+    из `OPEN` и `RECRUITMENT_CLOSED` возможен переход в `CANCELLED`.
+
+    Эндпоинты с тегом `internal` недоступны через API Gateway и вызываются только другими сервисами.
+  license: { name: Proprietary (учебный проект) }
+servers:
+  - url: http://localhost:8080
+    description: API Gateway (внешние эндпоинты /api/**)
+  - url: http://purchase-service:8081
+    description: Прямой адрес сервиса внутри сети (внутренние эндпоинты /internal/**)
+security:
+  - bearerAuth: []
+tags:
+  - name: public
+    description: Внешние эндпоинты, доступные клиенту через API Gateway
+  - name: admin
+    description: Эндпоинты модерации (роль ADMIN)
+  - name: internal
+    description: Внутренние эндпоинты для других сервисов
+x-async-messages:
+  - { eventType: purchase.published, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [participation-service, settlement-service, discovery-service], schema: { $ref: '#/components/schemas/PurchasePublishedEvent' } }
+  - { eventType: purchase.updated, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [participation-service, settlement-service, discovery-service], schema: { $ref: '#/components/schemas/PurchaseUpdatedEvent' } }
+  - { eventType: purchase.min-volume-reached, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [notification-service], schema: { $ref: '#/components/schemas/PurchaseMinVolumeReachedEvent' } }
+  - { eventType: purchase.closing-started, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [settlement-service], schema: { $ref: '#/components/schemas/PurchaseClosingStartedEvent' } }
+  - { eventType: purchase.closing-failed, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [settlement-service, notification-service], schema: { $ref: '#/components/schemas/PurchaseClosingFailedEvent' } }
+  - { eventType: purchase.recruitment-closed, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [discovery-service, notification-service], schema: { $ref: '#/components/schemas/PurchaseRecruitmentClosedEvent' } }
+  - { eventType: purchase.ordered, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [settlement-service, participation-service], schema: { $ref: '#/components/schemas/PurchaseOrderedEvent' } }
+  - { eventType: purchase.delivered, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [participation-service, settlement-service], schema: { $ref: '#/components/schemas/PurchaseDeliveredEvent' } }
+  - { eventType: purchase.completed, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [notification-service], schema: { $ref: '#/components/schemas/PurchaseCompletedEvent' } }
+  - { eventType: purchase.cancelled, topic: purchases, key: purchaseId, publisher: purchase-service, subscribers: [participation-service, settlement-service, discovery-service, notification-service], schema: { $ref: '#/components/schemas/PurchaseCancelledEvent' } }
+  - { eventType: participation.unfreeze, topic: participation-commands, key: purchaseId, publisher: purchase-service, subscribers: [participation-service], schema: { $ref: '#/components/schemas/UnfreezeParticipationsCommand' } }
+x-consumed-messages:
+  - { eventType: participation.changed, topic: participations, publisher: participation-service, schemaRef: participation-service.yaml#/components/schemas/ParticipationChangedEvent, action: "обновить счётчики collectedQuantity и participantsCount, при первом достижении minTotalQuantity опубликовать purchase.min-volume-reached" }
+  - { eventType: participation.all-handed-over, topic: participations, publisher: participation-service, schemaRef: participation-service.yaml#/components/schemas/ParticipationAllHandedOverEvent, action: "отметить, что все товары выданы; если уже получено settlement.all-paid - перевести закупку в COMPLETED" }
+  - { eventType: settlement.charges-created, topic: settlements, publisher: settlement-service, schemaRef: settlement-service.yaml#/components/schemas/SettlementChargesCreatedEvent, action: "завершить сагу закрытия набора - статус RECRUITMENT_CLOSED" }
+  - { eventType: settlement.charges-failed, topic: settlements, publisher: settlement-service, schemaRef: settlement-service.yaml#/components/schemas/SettlementChargesFailedEvent, action: "компенсация саги - вернуть OPEN и отправить команду participation.unfreeze" }
+  - { eventType: settlement.all-paid, topic: settlements, publisher: settlement-service, schemaRef: settlement-service.yaml#/components/schemas/SettlementAllPaidEvent, action: "отметить, что все оплаты учтены; если уже получено participation.all-handed-over - перевести закупку в COMPLETED" }
+paths:
+  /api/v1/purchases:
+    post:
+      tags: [public]
+      operationId: createPurchase
+      summary: Создать закупку
+      description: |
+        Роль: ORGANIZER. Закупка создаётся сразу в статусе `OPEN`, публикуется событие `purchase.published`.
+        Ступенчатые цены (`priceTiers`) необязательны; цена за единицу при наборе `N` = цена старшей ступени,
+        у которой `fromTotalQuantity <= N`, иначе `wholesaleUnitPrice`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePurchaseRequest' }
+            example:
+              title: Кофе в зёрнах Арабика 1 кг
+              description: Берём у обжарщика, срок хранения 6 месяцев. Помол не делаем.
+              category: GROCERIES
+              unit: KG
+              quantityStep: 0.5
+              minTotalQuantity: 5
+              maxTotalQuantity: 30
+              retailUnitPrice: { amount: '1600.00', currency: RUB }
+              wholesaleUnitPrice: { amount: '1250.00', currency: RUB }
+              priceTiers:
+                - { fromTotalQuantity: 10, unitPrice: { amount: '1150.00', currency: RUB } }
+              recruitmentDeadline: '2026-11-20T18:00:00Z'
+              pickupLocation: Общежитие №3, комната вахтёра
+      responses:
+        '201':
+          description: Закупка создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [public]
+      operationId: listPurchases
+      summary: Список закупок по статусу (без полнотекстового поиска)
+      description: |
+        Простой постраничный список для ссылок вида «все закупки в статусе». Полнотекстовый поиск и фильтры - в discovery-service.
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/PurchaseStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница закупок
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchasePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/purchases/{purchaseId}:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    get:
+      tags: [public]
+      operationId: getPurchase
+      summary: Карточка закупки
+      description: Доступна любому авторизованному пользователю. Поля collectedQuantity и participantsCount обновляются по событиям participation.changed (согласованность в конечном счёте).
+      responses:
+        '200':
+          description: Закупка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [public]
+      operationId: updatePurchase
+      summary: Изменить описание, место выдачи или продлить срок набора
+      description: |
+        Роль: ORGANIZER, владелец закупки. Только в статусе `OPEN`. Срок набора можно только продлевать.
+        Цены, единицу и минимальный объём менять нельзя - участники записывались под них.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdatePurchaseRequest' }
+            example:
+              description: Берём у обжарщика, срок хранения 6 месяцев.
+              recruitmentDeadline: '2026-11-22T18:00:00Z'
+      responses:
+        '200':
+          description: Закупка обновлена, опубликовано purchase.updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/organizers/me/purchases:
+    get:
+      tags: [public]
+      operationId: listMyPurchases
+      summary: Закупки текущего пользователя как организатора (история)
+      description: Роль ORGANIZER. Для личного кабинета и истории закупок.
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/PurchaseStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница закупок организатора
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchasePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/purchases/{purchaseId}/close-recruitment:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    post:
+      tags: [public]
+      operationId: closeRecruitment
+      summary: Закрыть набор (запустить сагу)
+      description: |
+        Роль: ORGANIZER, владелец закупки. Запускает сагу из трёх сервисов: фиксация участников (participation-service),
+        формирование начислений (settlement-service), смена статуса (purchase-service).
+
+        Ответ `202`: закупка переведена в `CLOSING`, итоговый статус `RECRUITMENT_CLOSED` клиент получает опросом
+        `GET /api/v1/purchases/{purchaseId}` (обычно за 1-3 секунды). Если набранный объём меньше минимального,
+        вернётся `409 MIN_VOLUME_NOT_REACHED`, статус останется `OPEN`.
+        Эта же сага запускается автоматически по истечении срока набора.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Сага запущена, закупка в статусе CLOSING
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/purchases/{purchaseId}/order:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    post:
+      tags: [public]
+      operationId: placeOrder
+      summary: Отметить, что заказ у поставщика оформлен
+      description: |
+        Роль: ORGANIZER, владелец. Допустимо из статуса `RECRUITMENT_CLOSED`. Стоимость доставки используется
+        settlement-service для итогового расчёта: доставка делится между участниками пропорционально количеству.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceOrderRequest' }
+            example:
+              supplierName: ООО «Зерно и кофе»
+              orderNumber: A-2041
+              deliveryCost: { amount: '600.00', currency: RUB }
+              expectedDeliveryDate: '2026-11-27'
+      responses:
+        '200':
+          description: Закупка в статусе ORDERED, опубликовано purchase.ordered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/purchases/{purchaseId}/deliver:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    post:
+      tags: [public]
+      operationId: markDelivered
+      summary: Отметить, что товар получен и можно раздавать
+      description: Роль ORGANIZER, владелец. Допустимо из статуса `ORDERED`. Повторный вызов в статусе DELIVERED возвращает 200 без изменений.
+      responses:
+        '200':
+          description: Закупка в статусе DELIVERED, опубликовано purchase.delivered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/purchases/{purchaseId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    post:
+      tags: [public]
+      operationId: cancelPurchase
+      summary: Отменить закупку организатором
+      description: |
+        Роль ORGANIZER, владелец. Допустимо из `OPEN` и `RECRUITMENT_CLOSED`. После заказа у поставщика отмена невозможна.
+        Публикуется `purchase.cancelled`: участия отменяются, начисления аннулируются.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelPurchaseRequest' }
+            example: { comment: Поставщик не может привезти товар к нужной дате }
+      responses:
+        '200':
+          description: Закупка отменена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/admin/purchases:
+    get:
+      tags: [admin]
+      operationId: adminListPurchases
+      summary: Список всех закупок для модерации
+      description: Роль ADMIN.
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/PurchaseStatus' }
+        - in: query
+          name: organizerId
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница закупок
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchasePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/purchases/{purchaseId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    post:
+      tags: [admin]
+      operationId: adminCancelPurchase
+      summary: Отменить закупку по результатам модерации
+      description: Роль ADMIN. Причина фиксируется как `MODERATION`. Допустимо из `OPEN` и `RECRUITMENT_CLOSED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelPurchaseRequest' }
+            example: { comment: Запрещённый к продаже товар }
+      responses:
+        '200':
+          description: Закупка отменена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Purchase' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /internal/v1/purchases/{purchaseId}:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    get:
+      tags: [internal]
+      operationId: getPurchaseInternal
+      summary: Краткие данные закупки для других сервисов
+      description: Вызывает comment-service, чтобы проверить, что закупка существует и принимает комментарии, и узнать организатора. Не обращается к другим сервисам, отвечает из собственной БД.
+      security:
+        - serviceToken: []
+      responses:
+        '200':
+          description: Краткое представление закупки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PurchaseInternalView' }
+              example:
+                id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                organizerId: 0b8f4a1e-5d34-4c0a-9f1b-6a2d3c4e5f60
+                status: OPEN
+                title: Кофе в зёрнах Арабика 1 кг
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT, выданный Keycloak (OAuth 2.0 / OIDC). Realm-роли PARTICIPANT, ORGANIZER, ADMIN.
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен сервисного аккаунта Keycloak (client credentials) с ролью internal-service. Используется только для /internal/**.
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: UUID, который клиент генерирует один раз на операцию. Повтор с тем же ключом возвращает результат первого вызова, а не выполняет операцию заново. Ключи хранятся 24 часа.
+      schema: { type: string, format: uuid }
+    PurchaseId:
+      in: path
+      name: purchaseId
+      required: true
+      description: Идентификатор закупки
+      schema: { type: string, format: uuid }
+    Page:
+      in: query
+      name: page
+      description: Номер страницы, начиная с 0
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      in: query
+      name: size
+      description: Размер страницы
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  responses:
+    BadRequest:
+      description: Ошибка валидации запроса
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/validation-error
+            title: Ошибка валидации
+            status: 400
+            code: VALIDATION_ERROR
+            detail: Поле quantity должно быть больше 0
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Unauthorized:
+      description: Нет токена или он недействителен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/unauthorized
+            title: Не авторизован
+            status: 401
+            code: UNAUTHORIZED
+            detail: Токен отсутствует или просрочен
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Forbidden:
+      description: Недостаточно прав (роль или не владелец ресурса)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/forbidden
+            title: Доступ запрещён
+            status: 403
+            code: FORBIDDEN
+            detail: Операция доступна только организатору закупки
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/not-found
+            title: Не найдено
+            status: 404
+            code: NOT_FOUND
+            detail: Ресурс с указанным идентификатором не существует
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Conflict:
+      description: Конфликт состояния (неподходящий статус, повтор с другим телом, нарушение инварианта). Конкретный код - в поле code.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/invalid-state
+            title: Конфликт состояния
+            status: 409
+            code: INVALID_STATE
+            detail: Операция недопустима в текущем статусе
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    ServiceUnavailable:
+      description: Зависимый сервис недоступен, операцию можно безопасно повторить с тем же Idempotency-Key
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/dependency-unavailable
+            title: Сервис временно недоступен
+            status: 503
+            code: DEPENDENCY_UNAVAILABLE
+            detail: participation-service не ответил за 2 секунды
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  schemas:
+    PurchaseId:
+      type: string
+      format: uuid
+      description: Идентификатор закупки
+    PurchaseStatus:
+      type: string
+      description: |
+        OPEN - идёт набор (виден прогресс); CLOSING - техническое, идёт сага закрытия (в интерфейсе показывается как «Открыта, закрывается»);
+        RECRUITMENT_CLOSED - набор завершён; ORDERED - заказано; DELIVERED - доставлено, идёт раздача; COMPLETED - завершена; CANCELLED - отменена.
+      enum: [OPEN, CLOSING, RECRUITMENT_CLOSED, ORDERED, DELIVERED, COMPLETED, CANCELLED]
+    PurchaseCategory:
+      type: string
+      enum: [GROCERIES, HOUSEHOLD, OFFICE, CLOTHING, ELECTRONICS, OTHER]
+    Unit:
+      type: string
+      description: Единица измерения
+      enum: [PCS, KG, G, L, ML, PACK]
+    CancelReason:
+      type: string
+      enum: [BY_ORGANIZER, MODERATION, MIN_VOLUME_NOT_REACHED]
+    PriceTier:
+      type: object
+      description: Ступень оптовой цены - с какого набранного объёма действует цена
+      required: [fromTotalQuantity, unitPrice]
+      properties:
+        fromTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        unitPrice: { $ref: '#/components/schemas/Money' }
+    CreatePurchaseRequest:
+      type: object
+      required: [title, category, unit, quantityStep, minTotalQuantity, retailUnitPrice, wholesaleUnitPrice, recruitmentDeadline, pickupLocation]
+      properties:
+        title: { type: string, minLength: 3, maxLength: 120 }
+        description: { type: string, maxLength: 4000 }
+        category: { $ref: '#/components/schemas/PurchaseCategory' }
+        unit: { $ref: '#/components/schemas/Unit' }
+        quantityStep: { $ref: '#/components/schemas/Quantity' }
+        minTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        maxTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        retailUnitPrice: { $ref: '#/components/schemas/Money' }
+        wholesaleUnitPrice: { $ref: '#/components/schemas/Money' }
+        priceTiers:
+          type: array
+          maxItems: 5
+          items: { $ref: '#/components/schemas/PriceTier' }
+        recruitmentDeadline: { type: string, format: date-time }
+        pickupLocation: { type: string, maxLength: 200 }
+    UpdatePurchaseRequest:
+      type: object
+      minProperties: 1
+      properties:
+        description: { type: string, maxLength: 4000 }
+        pickupLocation: { type: string, maxLength: 200 }
+        recruitmentDeadline: { type: string, format: date-time }
+    PlaceOrderRequest:
+      type: object
+      required: [supplierName, deliveryCost]
+      properties:
+        supplierName: { type: string, maxLength: 200 }
+        orderNumber: { type: string, maxLength: 64 }
+        deliveryCost: { $ref: '#/components/schemas/Money' }
+        expectedDeliveryDate: { type: string, format: date }
+    CancelPurchaseRequest:
+      type: object
+      required: [comment]
+      properties:
+        comment: { type: string, minLength: 3, maxLength: 500 }
+    Purchase:
+      type: object
+      required: [id, organizerId, title, category, unit, quantityStep, minTotalQuantity, retailUnitPrice, wholesaleUnitPrice, currentUnitPrice, collectedQuantity, participantsCount, status, recruitmentDeadline, pickupLocation, createdAt, version]
+      properties:
+        id: { $ref: '#/components/schemas/PurchaseId' }
+        organizerId: { type: string, format: uuid }
+        title: { type: string }
+        description: { type: string }
+        category: { $ref: '#/components/schemas/PurchaseCategory' }
+        unit: { $ref: '#/components/schemas/Unit' }
+        quantityStep: { $ref: '#/components/schemas/Quantity' }
+        minTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        maxTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        retailUnitPrice: { $ref: '#/components/schemas/Money' }
+        wholesaleUnitPrice: { $ref: '#/components/schemas/Money' }
+        priceTiers:
+          type: array
+          items: { $ref: '#/components/schemas/PriceTier' }
+        currentUnitPrice: { $ref: '#/components/schemas/Money' }
+        collectedQuantity: { type: number, minimum: 0, description: Набрано на сейчас (копия счётчика из participation-service) }
+        participantsCount: { type: integer, minimum: 0 }
+        status: { $ref: '#/components/schemas/PurchaseStatus' }
+        cancelReason: { $ref: '#/components/schemas/CancelReason' }
+        recruitmentDeadline: { type: string, format: date-time }
+        pickupLocation: { type: string }
+        finalUnitPrice:
+          description: Цена за единицу, зафиксированная при закрытии набора
+          $ref: '#/components/schemas/Money'
+        supplierName: { type: string }
+        deliveryCost: { $ref: '#/components/schemas/Money' }
+        expectedDeliveryDate: { type: string, format: date }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        version: { type: integer, description: Версия записи (оптимистичная блокировка) }
+      example:
+        id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        organizerId: 0b8f4a1e-5d34-4c0a-9f1b-6a2d3c4e5f60
+        title: Кофе в зёрнах Арабика 1 кг
+        description: Берём у обжарщика, срок хранения 6 месяцев.
+        category: GROCERIES
+        unit: KG
+        quantityStep: 0.5
+        minTotalQuantity: 5
+        maxTotalQuantity: 30
+        retailUnitPrice: { amount: '1600.00', currency: RUB }
+        wholesaleUnitPrice: { amount: '1250.00', currency: RUB }
+        priceTiers:
+          - { fromTotalQuantity: 10, unitPrice: { amount: '1150.00', currency: RUB } }
+        currentUnitPrice: { amount: '1250.00', currency: RUB }
+        collectedQuantity: 7
+        participantsCount: 4
+        status: OPEN
+        recruitmentDeadline: '2026-11-20T18:00:00Z'
+        pickupLocation: Общежитие №3, комната вахтёра
+        createdAt: '2026-11-12T09:30:00Z'
+        updatedAt: '2026-11-12T11:05:00Z'
+        version: 5
+    PurchasePage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Purchase' }
+    PurchaseInternalView:
+      type: object
+      required: [id, organizerId, status, title]
+      properties:
+        id: { $ref: '#/components/schemas/PurchaseId' }
+        organizerId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PurchaseStatus' }
+        title: { type: string }
+    PurchaseSnapshotPayload:
+      type: object
+      description: Полный снимок закупки. Потребители делают upsert по purchaseId (копия данных, обновляемая по событиям).
+      required: [purchaseId, organizerId, title, category, unit, quantityStep, minTotalQuantity, wholesaleUnitPrice, recruitmentDeadline, pickupLocation, status]
+      properties:
+        purchaseId: { type: string, format: uuid }
+        organizerId: { type: string, format: uuid }
+        title: { type: string }
+        description: { type: string }
+        category: { $ref: '#/components/schemas/PurchaseCategory' }
+        unit: { $ref: '#/components/schemas/Unit' }
+        quantityStep: { $ref: '#/components/schemas/Quantity' }
+        minTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        maxTotalQuantity: { $ref: '#/components/schemas/Quantity' }
+        retailUnitPrice: { $ref: '#/components/schemas/Money' }
+        wholesaleUnitPrice: { $ref: '#/components/schemas/Money' }
+        priceTiers:
+          type: array
+          items: { $ref: '#/components/schemas/PriceTier' }
+        recruitmentDeadline: { type: string, format: date-time }
+        pickupLocation: { type: string }
+        status: { $ref: '#/components/schemas/PurchaseStatus' }
+    PurchasePublishedEvent:
+      description: 'Топик purchases (ключ purchaseId). Издатель: purchase-service. Подписчики: participation-service, settlement-service, discovery-service.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.published }
+            payload: { $ref: '#/components/schemas/PurchaseSnapshotPayload' }
+    PurchaseUpdatedEvent:
+      description: 'Топик purchases (ключ purchaseId). Издатель: purchase-service. Подписчики: participation-service, settlement-service, discovery-service. Payload - полный снимок.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.updated }
+            payload: { $ref: '#/components/schemas/PurchaseSnapshotPayload' }
+    PurchaseMinVolumeReachedEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: notification-service (письмо организатору). Публикуется один раз, когда набранный объём впервые достиг минимального.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.min-volume-reached }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, title, collectedQuantity, minTotalQuantity]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                title: { type: string }
+                collectedQuantity: { type: number }
+                minTotalQuantity: { type: number }
+    PurchaseClosingStartedEvent:
+      description: 'Топик purchases (ключ purchaseId). Издатель: purchase-service. Подписчики: settlement-service. Участники уже зафиксированы, цена за единицу определена; settlement создаёт начисления. correlationId события равен sagaId.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.closing-started }
+            payload:
+              type: object
+              required: [purchaseId, sagaId, totalQuantity, participantsCount, unitPrice]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                sagaId: { type: string, format: uuid }
+                totalQuantity: { type: number }
+                participantsCount: { type: integer }
+                unitPrice: { $ref: '#/components/schemas/Money' }
+          example:
+            eventId: 3f6c2b0e-8d1a-4c57-9e2f-5a1b7c9d0e44
+            eventType: purchase.closing-started
+            schemaVersion: 1
+            occurredAt: '2026-11-20T18:00:03Z'
+            correlationId: 5d2c7a10-3b9e-4f6a-8c11-2e7f90ab1c3d
+            payload:
+              purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+              sagaId: 5d2c7a10-3b9e-4f6a-8c11-2e7f90ab1c3d
+              totalQuantity: 10.5
+              participantsCount: 6
+              unitPrice: { amount: '1150.00', currency: RUB }
+    PurchaseClosingFailedEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: settlement-service (аннулировать начисления этой саги, если они успели создаться), notification-service (письмо организатору). Публикуется при компенсации саги.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.closing-failed }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, sagaId, reason]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                sagaId: { type: string, format: uuid }
+                reason: { type: string, enum: [SETTLEMENT_FAILED, SETTLEMENT_TIMEOUT, PARTICIPATION_UNAVAILABLE] }
+    PurchaseRecruitmentClosedEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: discovery-service (убрать из поиска), notification-service (письмо организатору). Публикуется после успешного завершения саги.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.recruitment-closed }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, title, totalQuantity, participantsCount, unitPrice]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                title: { type: string }
+                totalQuantity: { type: number }
+                participantsCount: { type: integer }
+                unitPrice: { $ref: '#/components/schemas/Money' }
+    PurchaseOrderedEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: settlement-service (пересчёт с доставкой, начисления становятся окончательными), participation-service (смена статуса копии закупки).'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.ordered }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, deliveryCost]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                supplierName: { type: string }
+                deliveryCost: { $ref: '#/components/schemas/Money' }
+                expectedDeliveryDate: { type: string, format: date }
+    PurchaseDeliveredEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: participation-service (участия получают статус READY_FOR_PICKUP, выдача разрешена), settlement-service (смена статуса).'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.delivered }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, pickupLocation]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                pickupLocation: { type: string }
+    PurchaseCompletedEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: notification-service (письмо организатору). Публикуется, когда получены и participation.all-handed-over, и settlement.all-paid.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.completed }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, title]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                title: { type: string }
+    PurchaseCancelledEvent:
+      description: 'Топик purchases. Издатель: purchase-service. Подписчики: participation-service (отменить все участия), settlement-service (аннулировать начисления), discovery-service (удалить из индекса), notification-service (письмо организатору).'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: purchase.cancelled }
+            payload:
+              type: object
+              required: [purchaseId, organizerId, title, reason]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                organizerId: { type: string, format: uuid }
+                title: { type: string }
+                reason: { $ref: '#/components/schemas/CancelReason' }
+                comment: { type: string }
+    UnfreezeParticipationsCommand:
+      description: 'Команда. Топик participation-commands (ключ purchaseId). Издатель: purchase-service. Получатель: participation-service. Компенсирующее действие саги: вернуть участия из FROZEN в ACTIVE. Идемпотентна.'
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          properties:
+            eventType: { const: participation.unfreeze }
+            payload:
+              type: object
+              required: [purchaseId, sagaId]
+              properties:
+                purchaseId: { type: string, format: uuid }
+                sagaId: { type: string, format: uuid }
+    Problem:
+      type: object
+      description: Единая модель ошибки для всех сервисов (RFC 9457, Content-Type application/problem+json)
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, description: Ссылка на описание типа ошибки }
+        title: { type: string, description: Краткое описание }
+        status: { type: integer, description: HTTP-статус }
+        code: { type: string, description: Машинный код из справочника ошибок README, example: VALIDATION_ERROR }
+        detail: { type: string, description: Подробности для разработчика или пользователя }
+        instance: { type: string, description: Путь запроса }
+        traceId: { type: string, description: Идентификатор трассировки для поиска в логах }
+        errors:
+          type: array
+          description: Ошибки по полям (для VALIDATION_ERROR)
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }
+    Money:
+      type: object
+      description: Денежная сумма. Сумма - строка с десятичной точкой и двумя знаками, чтобы не терять точность.
+      required: [amount, currency]
+      properties:
+        amount: { type: string, pattern: '^\d+\.\d{2}$', example: '1250.00' }
+        currency: { type: string, enum: [RUB], example: RUB }
+    Quantity:
+      type: number
+      description: Количество в единицах закупки (кг, шт., л), кратное quantityStep закупки
+      exclusiveMinimum: 0
+      example: 2.5
+    PageMeta:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }
+    EventEnvelope:
+      type: object
+      description: Общий конверт всех событий и команд в Kafka
+      required: [eventId, eventType, schemaVersion, occurredAt, correlationId, payload]
+      properties:
+        eventId: { type: string, format: uuid, description: Уникальный идентификатор сообщения; потребитель хранит обработанные eventId и игнорирует повторы }
+        eventType: { type: string, description: Тип события или команды, например purchase.closing-started }
+        schemaVersion: { type: integer, minimum: 1, description: Версия схемы payload, example: 1 }
+        occurredAt: { type: string, format: date-time }
+        correlationId: { type: string, format: uuid, description: Сквозной идентификатор бизнес-операции (для саги - sagaId) }
+        payload: { type: object }

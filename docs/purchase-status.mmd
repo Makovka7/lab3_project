@@ -1,0 +1,13 @@
+stateDiagram-v2
+    [*] --> OPEN: createPurchase
+    OPEN --> CLOSING: closeRecruitment или истёк срок набора
+    CLOSING --> RECRUITMENT_CLOSED: сага успешна, settlement.charges-created
+    CLOSING --> OPEN: компенсация саги или минимум не набран при ручном закрытии
+    CLOSING --> CANCELLED: срок вышел и минимум не набран
+    OPEN --> CANCELLED: отмена организатором или модерация
+    RECRUITMENT_CLOSED --> CANCELLED: отмена организатором или модерация
+    RECRUITMENT_CLOSED --> ORDERED: placeOrder
+    ORDERED --> DELIVERED: markDelivered
+    DELIVERED --> COMPLETED: все выдано и все оплачено
+    COMPLETED --> [*]
+    CANCELLED --> [*]

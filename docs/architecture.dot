@@ -1,0 +1,60 @@
+digraph G {
+  graph [rankdir=TB, fontname="DejaVu Sans", nodesep=0.55, ranksep=1.25, splines=true, pad=0.3, dpi=110, label="Архитектура: уровень контейнеров (сплошные стрелки - синхронные вызовы, пунктир - события и команды через Kafka)", labelloc=t, fontsize=16];
+  node [fontname="DejaVu Sans", fontsize=11, style="filled,rounded", margin="0.18,0.12"];
+  edge [fontname="DejaVu Sans", fontsize=10];
+  client [label="Веб-клиент (SPA)\nбраузер", shape=box, fillcolor="#E8F0FE", color="#4A6FA5", style="filled,rounded"];
+  gw [label="API Gateway\nSpring Cloud Gateway\nпроверка JWT, маршрутизация, rate limiting", shape=box, fillcolor="#FFF4D6", color="#B58900", style="filled,rounded"];
+  kc [label="Keycloak\nOAuth 2.0 / OpenID Connect\nпользователи, роли", shape=box, fillcolor="#FFF4D6", color="#B58900", style="filled,rounded"];
+  redis_gw [label="Redis\nсчётчики rate limiting", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  purchase [label="purchase-service\n:8081\nзакупки, статусы, сага закрытия", shape=box, fillcolor="#D6EAF8", color="#1F618D", style="filled,rounded"];
+  participation [label="participation-service\n:8082\nучастие, счётчики набора, выдача", shape=box, fillcolor="#D6EAF8", color="#1F618D", style="filled,rounded"];
+  settlement [label="settlement-service\n:8083\nначисления, учёт оплат", shape=box, fillcolor="#D6EAF8", color="#1F618D", style="filled,rounded"];
+  discovery [label="discovery-service\n:8084\nпоиск и фильтры", shape=box, fillcolor="#D6EAF8", color="#1F618D", style="filled,rounded"];
+  comment [label="comment-service\n:8085\nкомментарии", shape=box, fillcolor="#D6EAF8", color="#1F618D", style="filled,rounded"];
+  notification [label="notification-service\n:8086\nemail-уведомления", shape=box, fillcolor="#D6EAF8", color="#1F618D", style="filled,rounded"];
+  db_purchase [label="PostgreSQL\npurchase_db", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  db_participation [label="PostgreSQL\nparticipation_db", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  db_settlement [label="PostgreSQL\nsettlement_db", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  db_discovery [label="OpenSearch\nиндекс purchases", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  db_comment [label="MongoDB\ncomments_db", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  db_notification [label="PostgreSQL\nnotification_db", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  redis_n [label="Redis\nкэш контактов", shape=cylinder, fillcolor="#EAEDED", color="#566573", style="filled"];
+  kafka [label="Apache Kafka\nтопики: purchases · participations · settlements · participation-commands", shape=box, fillcolor="#FDEBD0", color="#CA6F1E", style="filled,rounded"];
+  smtp [label="SMTP-провайдер\n(внешняя система)", shape=box, fillcolor="#F5EEF8", color="#7D3C98", style="filled,rounded"];
+  { rank=same; client; }
+  { rank=same; gw; kc; redis_gw; }
+  { rank=same; purchase; participation; settlement; discovery; comment; notification; }
+  { rank=same; db_purchase; db_participation; db_settlement; db_discovery; db_comment; db_notification; redis_n; smtp; }
+  { rank=same; kafka; }
+  comment -> purchase -> participation -> settlement -> discovery -> notification [style=invis, weight=10];
+  db_comment -> db_purchase -> db_participation -> db_settlement -> db_discovery -> db_notification -> redis_n -> smtp [style=invis, weight=10];
+  client -> gw [label="HTTPS\n/api/v1/**", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> kc [label="REST\nJWKS (ключи подписи JWT)", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> redis_gw [label="rate limit", color="#566573", arrowhead=none];
+  gw -> purchase [label="REST /api/v1/purchases/**,\n/api/v1/admin/**,\n/api/v1/organizers/me/**", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> participation [label="REST …/participations, …/progress,\n/api/v1/participations/**,\n/api/v1/users/me/participations", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> settlement [label="REST …/charges, …/settlement,\n/api/v1/charges/**,\n/api/v1/users/me/charges", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> discovery [label="REST\n/api/v1/discovery/**", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> comment [label="REST …/comments,\n/api/v1/comments/**", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  gw -> notification [label="REST /api/v1/notification-preferences,\n/api/v1/users/me/notifications", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  purchase -> participation [label="REST POST\n/internal/v1/purchases/{id}/freeze", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  settlement -> participation [label="REST GET\n/internal/v1/purchases/{id}/participations", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  comment -> purchase [label="REST GET\n/internal/v1/purchases/{id}", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  notification -> kc [label="REST Admin API\nGET /users/{id}", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  notification -> smtp [label="SMTP", color="#1F618D", fontcolor="#1F618D", penwidth=1.4];
+  notification -> redis_n [color="#566573", arrowhead=none];
+  purchase -> db_purchase [color="#566573", arrowhead=none];
+  participation -> db_participation [color="#566573", arrowhead=none];
+  settlement -> db_settlement [color="#566573", arrowhead=none];
+  discovery -> db_discovery [color="#566573", arrowhead=none];
+  comment -> db_comment [color="#566573", arrowhead=none];
+  notification -> db_notification [color="#566573", arrowhead=none];
+  purchase -> kafka [label="pub: purchases,\nparticipation-commands", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  participation -> kafka [label="pub: participations", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  settlement -> kafka [label="pub: settlements", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  kafka -> purchase [label="sub: participations,\nsettlements", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  kafka -> participation [label="sub: purchases,\nparticipation-commands", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  kafka -> settlement [label="sub: purchases", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  kafka -> discovery [label="sub: purchases,\nparticipations", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+  kafka -> notification [label="sub: purchases,\nparticipations,\nsettlements", style=dashed, color="#CA6F1E", fontcolor="#CA6F1E", penwidth=1.4, constraint=true];
+}

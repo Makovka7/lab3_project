@@ -1,0 +1,43 @@
+sequenceDiagram
+    autonumber
+    actor Org as Организатор (клиент)
+    participant GW as API Gateway
+    participant PS as purchase-service
+    participant PT as participation-service
+    participant K as Kafka
+    participant SS as settlement-service
+    participant NS as notification-service
+    participant DS as discovery-service
+
+    Org->>GW: POST /api/v1/purchases/{id}/close-recruitment<br/>Authorization JWT, Idempotency-Key
+    Note over GW: проверить JWT, rate limit
+    GW->>PS: POST /api/v1/purchases/{id}/close-recruitment
+    Note over PS: tx: проверить владельца, OPEN → CLOSING, создать сагу sagaId
+
+    Note over PS,PT: Шаг 1. Фиксация участников (синхронно)
+    PS->>PT: POST /internal/v1/purchases/{id}/freeze<br/>Idempotency-Key = sagaId, minTotalQuantity
+    Note over PT: tx: набрано ≥ минимума, ACTIVE → FROZEN, блокировка закупки
+    PT-->>PS: 200 totalQuantity = 10.5, participantsCount = 6
+    Note over PS: tx: finalUnitPrice по ступеням цены, запись в outbox
+    PS-->>GW: 202 Accepted, status = CLOSING
+    GW-->>Org: 202 Accepted
+
+    Note over PS,SS: Шаг 2. Расчёт начислений (асинхронно)
+    PS--)K: purchase.closing-started (топик purchases)
+    K--)SS: purchase.closing-started
+    SS->>PT: GET /internal/v1/purchases/{id}/participations?page=0&size=200
+    PT-->>SS: 200 список userId + quantity
+    Note over SS: tx: создать начисления PRELIMINARY, запись в outbox
+    SS--)K: settlement.charges-created + settlement.charge-issued × N (топик settlements)
+
+    Note over PS,NS: Шаг 3. Завершение саги и оповещения
+    K--)PS: settlement.charges-created
+    Note over PS: tx: CLOSING → RECRUITMENT_CLOSED, сага COMPLETED, запись в outbox
+    PS--)K: purchase.recruitment-closed
+    K--)DS: purchase.recruitment-closed → удалить из поискового индекса
+    K--)NS: settlement.charge-issued → письма участникам с суммой
+    K--)NS: purchase.recruitment-closed → письмо организатору
+
+    Org->>GW: GET /api/v1/purchases/{id} (опрос)
+    GW->>PS: GET /api/v1/purchases/{id}
+    PS-->>Org: 200 status = RECRUITMENT_CLOSED

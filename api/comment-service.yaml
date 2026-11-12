@@ -1,0 +1,293 @@
+openapi: 3.1.0
+info:
+  title: comment-service
+  version: 1.0.0
+  summary: Комментарии к закупкам - вопросы организатору и обсуждение между участниками
+  description: |
+    Сервис владеет сущностью **Комментарий**. Хранит комментарии как документы в MongoDB: на странице закупки они
+    читаются целиком одной выборкой по `purchaseId` с курсорной пагинацией.
+
+    При добавлении комментария сервис синхронно обращается к purchase-service (`GET /internal/v1/purchases/{purchaseId}`),
+    чтобы убедиться, что закупка существует и принимает комментарии. Чтение комментариев от purchase-service не зависит.
+    Если purchase-service недоступен, добавление вернёт `503`, а чтение продолжит работать.
+  license: { name: Proprietary (учебный проект) }
+servers:
+  - url: http://localhost:8080
+    description: API Gateway (внешние эндпоинты /api/**)
+  - url: http://comment-service:8085
+    description: Прямой адрес сервиса внутри сети
+security:
+  - bearerAuth: []
+tags:
+  - name: public
+    description: Внешние эндпоинты, доступные клиенту через API Gateway
+x-async-messages: []
+x-consumed-messages: []
+paths:
+  /api/v1/purchases/{purchaseId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/PurchaseId'
+    get:
+      tags: [public]
+      operationId: listComments
+      summary: Комментарии к закупке
+      description: |
+        Доступно любому авторизованному пользователю. Порядок - по времени создания. Курсорная пагинация:
+        значение `nextCursor` из ответа передаётся в `cursor` следующего запроса; `null` означает конец списка.
+      parameters:
+        - in: query
+          name: cursor
+          description: Непрозрачный курсор из предыдущего ответа
+          schema: { type: string }
+        - in: query
+          name: limit
+          description: Сколько комментариев вернуть
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+      responses:
+        '200':
+          description: Страница комментариев
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommentPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [public]
+      operationId: addComment
+      summary: Добавить комментарий
+      description: |
+        Любой авторизованный пользователь. `parentId` - ответ на другой комментарий (один уровень вложенности).
+        Нельзя комментировать закупки в статусах `CANCELLED` и `COMPLETED` (`409 COMMENTS_CLOSED`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCommentRequest' }
+            example:
+              text: Помол делаете? Мне нужен под турку.
+      responses:
+        '201':
+          description: Комментарий создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Comment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /api/v1/comments/{commentId}:
+    parameters:
+      - $ref: '#/components/parameters/CommentId'
+    patch:
+      tags: [public]
+      operationId: editComment
+      summary: Изменить свой комментарий
+      description: Только автор и только в течение 15 минут после создания, иначе `409 EDIT_WINDOW_EXPIRED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EditCommentRequest' }
+            example: { text: 'Помол делаете? Мне нужен под турку, 500 г.' }
+      responses:
+        '200':
+          description: Комментарий изменён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Comment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [public]
+      operationId: deleteComment
+      summary: Удалить комментарий
+      description: |
+        Может автор, организатор закупки (для проверки сервис обращается к purchase-service) или ADMIN.
+        Удаление мягкое: текст заменяется пометкой, чтобы не ломать ветку ответов. Повтор возвращает 204.
+      responses:
+        '204':
+          description: Комментарий удалён
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT, выданный Keycloak (OAuth 2.0 / OIDC). Realm-роли PARTICIPANT, ORGANIZER, ADMIN.
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен сервисного аккаунта Keycloak (client credentials) с ролью internal-service. Используется только для /internal/**.
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: UUID, который клиент генерирует один раз на операцию. Повтор с тем же ключом возвращает результат первого вызова, а не выполняет операцию заново. Ключи хранятся 24 часа.
+      schema: { type: string, format: uuid }
+    PurchaseId:
+      in: path
+      name: purchaseId
+      required: true
+      description: Идентификатор закупки
+      schema: { type: string, format: uuid }
+    CommentId:
+      in: path
+      name: commentId
+      required: true
+      description: Идентификатор комментария
+      schema: { type: string, format: uuid }
+  responses:
+    BadRequest:
+      description: Ошибка валидации запроса
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/validation-error
+            title: Ошибка валидации
+            status: 400
+            code: VALIDATION_ERROR
+            detail: Поле quantity должно быть больше 0
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Unauthorized:
+      description: Нет токена или он недействителен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/unauthorized
+            title: Не авторизован
+            status: 401
+            code: UNAUTHORIZED
+            detail: Токен отсутствует или просрочен
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Forbidden:
+      description: Недостаточно прав (роль или не владелец ресурса)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/forbidden
+            title: Доступ запрещён
+            status: 403
+            code: FORBIDDEN
+            detail: Операция доступна только организатору закупки
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/not-found
+            title: Не найдено
+            status: 404
+            code: NOT_FOUND
+            detail: Ресурс с указанным идентификатором не существует
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Conflict:
+      description: Конфликт состояния (неподходящий статус, повтор с другим телом, нарушение инварианта). Конкретный код - в поле code.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/invalid-state
+            title: Конфликт состояния
+            status: 409
+            code: INVALID_STATE
+            detail: Операция недопустима в текущем статусе
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    ServiceUnavailable:
+      description: Зависимый сервис недоступен, операцию можно безопасно повторить с тем же Idempotency-Key
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/dependency-unavailable
+            title: Сервис временно недоступен
+            status: 503
+            code: DEPENDENCY_UNAVAILABLE
+            detail: participation-service не ответил за 2 секунды
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  schemas:
+    CreateCommentRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1, maxLength: 2000 }
+        parentId: { type: string, format: uuid, description: Идентификатор комментария верхнего уровня, на который это ответ }
+    EditCommentRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1, maxLength: 2000 }
+    Comment:
+      type: object
+      required: [id, purchaseId, authorId, authorName, text, createdAt, deleted]
+      properties:
+        id: { type: string, format: uuid }
+        purchaseId: { type: string, format: uuid }
+        authorId: { type: string, format: uuid }
+        authorName: { type: string, description: Имя автора на момент написания (берётся из токена) }
+        parentId: { type: string, format: uuid }
+        text: { type: string }
+        createdAt: { type: string, format: date-time }
+        editedAt: { type: string, format: date-time }
+        deleted: { type: boolean }
+      example:
+        id: 6a5b4c3d-2e1f-4091-8a7b-6c5d4e3f2a1b
+        purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        authorId: 9e1b2c3d-4f50-4a61-8b72-c3d4e5f60718
+        authorName: Мария К.
+        text: Помол делаете? Мне нужен под турку.
+        createdAt: '2026-11-12T10:40:00Z'
+        deleted: false
+    CommentPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Comment' }
+        nextCursor:
+          type: [string, 'null']
+          description: Курсор следующей страницы, null - комментариев больше нет
+    Problem:
+      type: object
+      description: Единая модель ошибки для всех сервисов (RFC 9457, Content-Type application/problem+json)
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, description: Ссылка на описание типа ошибки }
+        title: { type: string, description: Краткое описание }
+        status: { type: integer, description: HTTP-статус }
+        code: { type: string, description: Машинный код из справочника ошибок README, example: VALIDATION_ERROR }
+        detail: { type: string, description: Подробности для разработчика или пользователя }
+        instance: { type: string, description: Путь запроса }
+        traceId: { type: string, description: Идентификатор трассировки для поиска в логах }
+        errors:
+          type: array
+          description: Ошибки по полям (для VALIDATION_ERROR)
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }

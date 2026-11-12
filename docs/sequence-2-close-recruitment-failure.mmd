@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    actor Org as Организатор (клиент)
+    participant PS as purchase-service
+    participant PT as participation-service
+    participant K as Kafka
+    participant SS as settlement-service
+    participant NS as notification-service
+
+    Note over Org,PT: Начало как в успешном сценарии: статус CLOSING, участия FROZEN, организатору возвращён 202
+    PS--)K: purchase.closing-started
+    K--)SS: purchase.closing-started
+
+    Note over SS,PT: СБОЙ на шаге расчёта: participation-service не отвечает
+    SS->>PT: GET /internal/v1/purchases/{id}/participations (таймаут 2 с)
+    PT--xSS: нет ответа
+    SS->>PT: повторы через 1 с, 2 с и 4 с
+    PT--xSS: нет ответа, попытки исчерпаны
+    Note over SS: tx откатывается, начисления не созданы
+    SS--)K: settlement.charges-failed, reason = PARTICIPATION_UNAVAILABLE
+
+    Note over PS,PT: Компенсация саги
+    K--)PS: settlement.charges-failed
+    Note over PS: tx: сага FAILED, CLOSING → OPEN, запись в outbox
+    PS--)K: команда participation.unfreeze (топик participation-commands)
+    PS--)K: purchase.closing-failed (топик purchases)
+    K--)PT: participation.unfreeze
+    Note over PT: FROZEN → ACTIVE, снять блокировку (идемпотентно)
+    PT--)K: participation.changed (актуальные счётчики)
+    K--)SS: purchase.closing-failed → запомнить sagaId как отменённую, аннулировать начисления, если они уже есть
+    K--)NS: purchase.closing-failed → письмо организатору, что набор не закрыт и можно повторить
+
+    Org->>PS: GET /api/v1/purchases/{id} (через Gateway)
+    PS-->>Org: 200 status = OPEN
+    Note over Org,PT: Участники снова могут менять записи. Организатор повторяет закрытие с новым Idempotency-Key

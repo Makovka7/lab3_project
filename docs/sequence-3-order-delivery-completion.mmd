@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    actor Org as Организатор (клиент)
+    participant PS as purchase-service
+    participant K as Kafka
+    participant SS as settlement-service
+    participant PT as participation-service
+    participant NS as notification-service
+
+    Note over Org,NS: Запросы клиента идут через API Gateway (на схеме опущен)
+    Org->>PS: POST /api/v1/purchases/{id}/order, deliveryCost = 600.00
+    Note over PS: tx: RECRUITMENT_CLOSED → ORDERED, запись в outbox
+    PS-->>Org: 200 status = ORDERED
+    PS--)K: purchase.ordered
+    K--)SS: purchase.ordered
+    Note over SS: tx: распределить доставку пропорционально количеству, PRELIMINARY → UNPAID
+    SS--)K: settlement.charge-finalized × N
+    K--)NS: письма участникам с окончательной суммой
+
+    Org->>PS: POST /api/v1/purchases/{id}/deliver
+    Note over PS: tx: ORDERED → DELIVERED, запись в outbox
+    PS-->>Org: 200 status = DELIVERED
+    PS--)K: purchase.delivered
+    K--)PT: purchase.delivered
+    Note over PT: FROZEN → READY_FOR_PICKUP
+    PT--)K: participation.pickup-ready × N
+    K--)NS: письма участникам: товар можно забирать
+
+    loop для каждого участника
+        Org->>PT: POST /api/v1/participations/{id}/handover
+        Org->>SS: POST /api/v1/charges/{id}/mark-paid
+    end
+    PT--)K: participation.all-handed-over
+    SS--)K: settlement.all-paid
+    K--)PS: participation.all-handed-over
+    K--)PS: settlement.all-paid
+    Note over PS: tx: получены оба события, DELIVERED → COMPLETED
+    PS--)K: purchase.completed
+    K--)NS: purchase.completed → письмо организатору

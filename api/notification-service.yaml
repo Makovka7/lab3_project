@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: notification-service
+  version: 1.0.0
+  summary: Email-уведомления участникам и организаторам по событиям закупок
+  description: |
+    Сервис только слушает события Kafka и отправляет письма; сбой отправки никогда не влияет на закупку.
+    Адрес получателя по `userId` сервис получает из Keycloak Admin API (учётные записи пользователей хранятся в Keycloak)
+    и кэширует в Redis на 1 час.
+
+    Сервис владеет журналом уведомлений и настройками пользователя. Для каждого сообщения Kafka ключом идемпотентности служит пара
+    `(eventId, userId)`: повторная доставка события не приводит к повторному письму. Сообщения, которые не удалось обработать
+    после трёх попыток, попадают в dead letter topic `<topic>.dlq`.
+
+    Внутренних (`internal`) эндпоинтов у сервиса нет, исходящих событий он не публикует.
+  license: { name: Proprietary (учебный проект) }
+servers:
+  - url: http://localhost:8080
+    description: API Gateway (внешние эндпоинты /api/**)
+  - url: http://notification-service:8086
+    description: Прямой адрес сервиса внутри сети
+security:
+  - bearerAuth: []
+tags:
+  - name: public
+    description: Внешние эндпоинты, доступные клиенту через API Gateway
+x-async-messages: []
+x-consumed-messages:
+  - { eventType: purchase.min-volume-reached, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseMinVolumeReachedEvent", action: "письмо организатору (MIN_VOLUME_REACHED): минимум набран, можно закрывать набор" }
+  - { eventType: purchase.recruitment-closed, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseRecruitmentClosedEvent", action: "письмо организатору (RECRUITMENT_CLOSED): набор закрыт, можно оформлять заказ" }
+  - { eventType: purchase.closing-failed, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseClosingFailedEvent", action: "письмо организатору (CLOSING_FAILED): закрыть набор не удалось, закупка снова открыта" }
+  - { eventType: purchase.completed, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseCompletedEvent", action: "письмо организатору (PURCHASE_COMPLETED)" }
+  - { eventType: purchase.cancelled, topic: purchases, publisher: purchase-service, schemaRef: "purchase-service.yaml#/components/schemas/PurchaseCancelledEvent", action: "письмо организатору (PURCHASE_CANCELLED_ORGANIZER) с причиной отмены" }
+  - { eventType: participation.pickup-ready, topic: participations, publisher: participation-service, schemaRef: "participation-service.yaml#/components/schemas/ParticipationPickupReadyEvent", action: "письмо участнику (PICKUP_READY): товар можно забирать, место выдачи" }
+  - { eventType: participation.cancelled, topic: participations, publisher: participation-service, schemaRef: "participation-service.yaml#/components/schemas/ParticipationCancelledEvent", action: "письмо участнику (PURCHASE_CANCELLED_PARTICIPANT), только если reason = PURCHASE_CANCELLED" }
+  - { eventType: settlement.charge-issued, topic: settlements, publisher: settlement-service, schemaRef: "settlement-service.yaml#/components/schemas/SettlementChargeIssuedEvent", action: "письмо участнику (CHARGE_ISSUED): набор закрыт, предварительная сумма" }
+  - { eventType: settlement.charge-finalized, topic: settlements, publisher: settlement-service, schemaRef: "settlement-service.yaml#/components/schemas/SettlementChargeFinalizedEvent", action: "письмо участнику (CHARGE_FINALIZED): окончательная сумма с доставкой" }
+paths:
+  /api/v1/notification-preferences:
+    get:
+      tags: [public]
+      operationId: getNotificationPreferences
+      summary: Мои настройки уведомлений
+      description: Если пользователь ещё не менял настройки, возвращаются значения по умолчанию (все включены).
+      responses:
+        '200':
+          description: Настройки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferences' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [public]
+      operationId: updateNotificationPreferences
+      summary: Изменить настройки уведомлений
+      description: Полная замена настроек. Идемпотентна по определению PUT.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationPreferences' }
+            example:
+              emailEnabled: true
+              participantMessages: true
+              organizerMessages: false
+      responses:
+        '200':
+          description: Настройки сохранены
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferences' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/users/me/notifications:
+    get:
+      tags: [public]
+      operationId: listMyNotifications
+      summary: Журнал моих уведомлений
+      description: Последние уведомления пользователя, новые первыми. Показывает и неотправленные (`FAILED`, `SKIPPED`).
+      parameters:
+        - in: query
+          name: status
+          schema: { $ref: '#/components/schemas/NotificationStatus' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Страница уведомлений
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT, выданный Keycloak (OAuth 2.0 / OIDC). Realm-роли PARTICIPANT, ORGANIZER, ADMIN.
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен сервисного аккаунта Keycloak (client credentials) с ролью internal-service. Используется только для /internal/**.
+  parameters:
+    Page:
+      in: query
+      name: page
+      description: Номер страницы, начиная с 0
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      in: query
+      name: size
+      description: Размер страницы
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  responses:
+    BadRequest:
+      description: Ошибка валидации запроса
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/validation-error
+            title: Ошибка валидации
+            status: 400
+            code: VALIDATION_ERROR
+            detail: Поле quantity должно быть больше 0
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+    Unauthorized:
+      description: Нет токена или он недействителен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://gp.example/errors/unauthorized
+            title: Не авторизован
+            status: 401
+            code: UNAUTHORIZED
+            detail: Токен отсутствует или просрочен
+            instance: /api/v1/example
+            traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+  schemas:
+    NotificationType:
+      type: string
+      enum: [MIN_VOLUME_REACHED, RECRUITMENT_CLOSED, CLOSING_FAILED, PURCHASE_COMPLETED, PURCHASE_CANCELLED_ORGANIZER, CHARGE_ISSUED, CHARGE_FINALIZED, PICKUP_READY, PURCHASE_CANCELLED_PARTICIPANT]
+    NotificationStatus:
+      type: string
+      description: 'PENDING - ждёт отправки или повторной попытки, SENT - отправлено, FAILED - исчерпаны попытки, SKIPPED - пропущено из-за настроек пользователя'
+      enum: [PENDING, SENT, FAILED, SKIPPED]
+    NotificationPreferences:
+      type: object
+      required: [emailEnabled, participantMessages, organizerMessages]
+      properties:
+        emailEnabled: { type: boolean, description: Главный выключатель email }
+        participantMessages: { type: boolean, description: Письма участнику (суммы, выдача, отмена) }
+        organizerMessages: { type: boolean, description: Письма организатору (минимум набран, набор закрыт, завершение) }
+      example:
+        emailEnabled: true
+        participantMessages: true
+        organizerMessages: true
+    Notification:
+      type: object
+      required: [id, type, subject, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/NotificationType' }
+        purchaseId: { type: string, format: uuid }
+        subject: { type: string }
+        status: { $ref: '#/components/schemas/NotificationStatus' }
+        attempts: { type: integer, minimum: 0 }
+        createdAt: { type: string, format: date-time }
+        sentAt: { type: string, format: date-time }
+      example:
+        id: e1f2a3b4-c5d6-4e7f-8091-a2b3c4d5e6f7
+        type: CHARGE_ISSUED
+        purchaseId: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+        subject: 'Набор закрыт: ваша сумма за «Кофе в зёрнах Арабика 1 кг»'
+        status: SENT
+        attempts: 1
+        createdAt: '2026-11-20T18:00:06Z'
+        sentAt: '2026-11-20T18:00:08Z'
+    NotificationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Notification' }
+    Problem:
+      type: object
+      description: Единая модель ошибки для всех сервисов (RFC 9457, Content-Type application/problem+json)
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri-reference, description: Ссылка на описание типа ошибки }
+        title: { type: string, description: Краткое описание }
+        status: { type: integer, description: HTTP-статус }
+        code: { type: string, description: Машинный код из справочника ошибок README, example: VALIDATION_ERROR }
+        detail: { type: string, description: Подробности для разработчика или пользователя }
+        instance: { type: string, description: Путь запроса }
+        traceId: { type: string, description: Идентификатор трассировки для поиска в логах }
+        errors:
+          type: array
+          description: Ошибки по полям (для VALIDATION_ERROR)
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }
+    PageMeta:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page: { type: integer, minimum: 0 }
+        size: { type: integer, minimum: 1 }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }
